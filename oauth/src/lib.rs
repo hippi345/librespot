@@ -222,10 +222,32 @@ fn get_authcode_listener(
         .next()
         .ok_or(OAuthError::AuthCodeListenerTerminated)?;
     let mut reader = BufReader::new(&stream);
+
+    // Skip empty or blank leading lines (bounded to prevent infinite loop).
+    // Some browsers may send blank lines before the HTTP request line.
     let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|_| OAuthError::AuthCodeListenerRead)?;
+    const MAX_BLANK_LINES: usize = 10;
+    for _ in 0..MAX_BLANK_LINES {
+        request_line.clear();
+        let bytes_read = reader
+            .read_line(&mut request_line)
+            .map_err(|_| OAuthError::AuthCodeListenerRead)?;
+
+        // EOF without finding a valid request line
+        if bytes_read == 0 {
+            return Err(OAuthError::AuthCodeListenerParse);
+        }
+
+        // Found a non-blank line, stop here
+        if !request_line.trim().is_empty() {
+            break;
+        }
+    }
+
+    // If we exhausted the limit and the line is still blank, fail
+    if request_line.trim().is_empty() {
+        return Err(OAuthError::AuthCodeListenerParse);
+    }
 
     let redirect_url = request_line
         .split_whitespace()
@@ -785,7 +807,9 @@ impl DeviceAuthClientBuilder {
 
 #[cfg(test)]
 mod test {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::io::Write;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+    use std::thread;
 
     use super::*;
 
@@ -829,5 +853,84 @@ mod test {
             get_socket_address("http://[2001:4860:4860::8888]:8888/foo"),
             Some(addr_v6)
         );
+    }
+
+    #[test]
+    fn authcode_listener_skips_blank_lines_crlf() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 38765));
+
+        let handle = thread::spawn(move || get_authcode_listener(addr, String::from("OK")));
+
+        thread::sleep(std::time::Duration::from_millis(100));
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // Send blank lines with CRLF before the actual request
+        stream
+            .write_all(b"\r\n\r\nGET /login?code=test_code HTTP/1.1\r\n\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().secret(), "test_code");
+    }
+
+    #[test]
+    fn authcode_listener_skips_blank_lines_lf() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 38766));
+
+        let handle = thread::spawn(move || get_authcode_listener(addr, String::from("OK")));
+
+        thread::sleep(std::time::Duration::from_millis(100));
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // Send blank lines with LF before the actual request
+        stream
+            .write_all(b"\n\nGET /login?code=another_code HTTP/1.1\r\n\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().secret(), "another_code");
+    }
+
+    #[test]
+    fn authcode_listener_fails_on_only_blank_lines() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 38767));
+
+        let handle = thread::spawn(move || get_authcode_listener(addr, String::from("OK")));
+
+        thread::sleep(std::time::Duration::from_millis(100));
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // Send many blank lines exceeding the limit
+        for _ in 0..15 {
+            stream.write_all(b"\r\n").unwrap();
+        }
+        stream.flush().unwrap();
+
+        let result = handle.join().unwrap();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            OAuthError::AuthCodeListenerParse
+        ));
+    }
+
+    #[test]
+    fn authcode_listener_fails_on_eof() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 38768));
+
+        let handle = thread::spawn(move || get_authcode_listener(addr, String::from("OK")));
+
+        thread::sleep(std::time::Duration::from_millis(100));
+        let stream = TcpStream::connect(addr).unwrap();
+        // Close the stream immediately without sending anything
+        drop(stream);
+
+        let result = handle.join().unwrap();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            OAuthError::AuthCodeListenerParse
+        ));
     }
 }
